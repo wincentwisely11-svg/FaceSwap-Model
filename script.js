@@ -64,6 +64,48 @@ function blur(a, w, h, r) { // box blur 2x ~ gaussian, in-place
   return a;
 }
 
+
+// jarak ke tepi mask (dalam piksel*3, chamfer 3-4) untuk piksel di dalam mask
+function distIn(mask, w, h) {
+  const d = new Float32Array(w * h);
+  for (let i = 0; i < d.length; i++) d[i] = mask[i] ? 1e9 : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (!d[i]) continue;
+    let v = d[i];
+    if (x > 0) v = Math.min(v, d[i - 1] + 3);
+    if (y > 0) { v = Math.min(v, d[i - w] + 3); if (x > 0) v = Math.min(v, d[i - w - 1] + 4); if (x < w - 1) v = Math.min(v, d[i - w + 1] + 4); }
+    d[i] = v;
+  }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+    const i = y * w + x;
+    if (!d[i]) continue;
+    let v = d[i];
+    if (x < w - 1) v = Math.min(v, d[i + 1] + 3);
+    if (y < h - 1) { v = Math.min(v, d[i + w] + 3); if (x < w - 1) v = Math.min(v, d[i + w + 1] + 4); if (x > 0) v = Math.min(v, d[i + w - 1] + 4); }
+    d[i] = v;
+  }
+  return d;
+}
+
+// pertajam ringan (unsharp mask) untuk mengembalikan detail saat sumber diperbesar
+function sharpen(L, w, h, r, amt) {
+  if (amt <= 0.02) return;
+  const N = w * h, a = new Float32Array(N);
+  for (let k = 0; k < 3; k++) {
+    for (let i = 0; i < N; i++) a[i] = L[i * 4 + k];
+    const b = blur(a.slice(), w, h, r);
+    for (let i = 0; i < N; i++) if (L[i * 4 + 3] > 250) L[i * 4 + k] = a[i] + amt * (a[i] - b[i]);
+  }
+}
+
+// sudut kemiringan wajah: 0 = tegak, 180 = terbalik (dari vektor mulut -> mata)
+function rollOf(P) {
+  const m = (a, b) => [(P[a][0] + P[b][0]) / 2, (P[a][1] + P[b][1]) / 2];
+  const e = m(33, 263), o = m(61, 291);
+  return Math.atan2(e[0] - o[0], o[1] - e[1]) * 180 / Math.PI;
+}
+
 /* ---------- triangulasi Delaunay (Bowyer-Watson) ---------- */
 function inCircum(P, t, px, py) {
   const [a, b, c] = t.map(i => P[i]);
@@ -169,8 +211,8 @@ function matchColor(L, T, skin, w, h, faceW) {
 }
 
 /* ---------- Poisson blending: offset harmonik di grid kasar, lalu campur lembut ---------- */
-function poissonBlend(L, T, D, hard, alpha, w, h) {
-  const s = 4, lw = Math.ceil(w / s) + 2, lh = Math.ceil(h / s) + 2;
+function poissonBlend(L, T, D, hard, alpha, w, h, s, good) {
+  const lw = Math.ceil(w / s) + 2, lh = Math.ceil(h / s) + 2;
   const val = [0, 1, 2].map(() => new Float32Array(lw * lh)), inside = new Uint8Array(lw * lh);
   for (let j = 0; j < lh; j++) for (let i = 0; i < lw; i++) {
     const d = [0, 0, 0];
@@ -179,7 +221,7 @@ function poissonBlend(L, T, D, hard, alpha, w, h) {
       const p = clamp(yy, 0, h - 1) * w + clamp(xx, 0, w - 1);
       tot++;
       if (hard[p] > 0.5) m++;
-      if (L[p * 4 + 3] > 250) { for (let k = 0; k < 3; k++) d[k] += T[p * 4 + k] - L[p * 4 + k]; n++; }
+      if (L[p * 4 + 3] > 250 && good[p]) { for (let k = 0; k < 3; k++) d[k] += T[p * 4 + k] - L[p * 4 + k]; n++; }
     }
     const c = j * lw + i, edge = i === 0 || j === 0 || i === lw - 1 || j === lh - 1;
     inside[c] = (!edge && m * 2 > tot) ? 1 : 0;
@@ -225,11 +267,23 @@ function blendFace(S, sp, T, tp) {
 
   // 1) warp wajah sumber ke bentuk wajah tujuan
   const L = warp(S, sp, tp, delaunay(tp), w, h);
+  const sxs = sp.map(p => p[0]), srcW = Math.max(...sxs) - Math.min(...sxs);
+  sharpen(L, w, h, Math.max(1, Math.round(faceW * 0.008)), clamp((faceW / srcW - 1) * 0.8, 0, 0.7));
 
-  // 2) mask oval; dahi dikecilkan lebih banyak (menghindari poni/rambut)
+  // 2) mask: oval wajah (dahi dikecilkan halus), lalu memudar KE DALAM kontur wajah tujuan.
+  //    Kontur asli (pipi, rahang, garis rambut) tetap utuh dan tajam; tidak ada bocoran ke latar.
   const oval = pick(tp, OVAL), c = centroid(oval);
-  const hard = fillPoly(oval.map(([x, y]) => { const f = y < c[1] ? 0.9 : 0.95; return [c[0] + (x - c[0]) * f, c[1] + (y - c[1]) * f]; }), w, h);
-  const alpha = blur(hard.slice(), w, h, faceW * 0.03);
+  const base = fillPoly(oval.map(([x, y]) => {
+    const t = clamp((c[1] - y) / (0.5 * faceH), 0, 1);
+    return [c[0] + (x - c[0]) * (1 - 0.03 * t), c[1] + (y - c[1]) * (1 - 0.10 * t * t)];
+  }), w, h);
+  const dmap = distIn(base, w, h);
+  const inset = Math.max(4, faceW * 0.022), feather = Math.max(4, faceW * 0.04);
+  const hard = new Float32Array(N), alpha = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const d = dmap[i] / 3;
+    if (d > inset) { hard[i] = 1; const t = clamp((d - inset) / feather, 0, 1); alpha[i] = t * t * (3 - 2 * t); }
+  }
 
   // 3) pertahankan mata/mulut tujuan bila ekspresi sumber jauh lebih tertutup
   const open = (P, u, l, a, b) => dist(P[u], P[l]) / dist(P[a], P[b]);
@@ -280,16 +334,18 @@ function blendFace(S, sp, T, tp) {
 
   // 6) Poisson + campur lembut
   const D = new Uint8ClampedArray(td);
-  poissonBlend(L, td, D, hard, alpha, w, h);
+  const good = new Uint8Array(N);
+  for (let i = 0; i < N; i++) good[i] = (occ[i] < 0.2 && hole[i] < 0.5) ? 1 : 0;
+  poissonBlend(L, td, D, hard, alpha, w, h, faceW < 220 ? 2 : 4, good);
   return D;
 }
 
-if (typeof module !== "undefined") module.exports = { blendFace, delaunay, fillPoly, blur, OVAL, LIPS_IN, EYE_R, EYE_L, BROW_R, BROW_L, LIPS_OUT, SKIN_REF };
+if (typeof module !== "undefined") module.exports = { rollOf, distIn, blendFace, delaunay, fillPoly, blur, OVAL, LIPS_IN, EYE_R, EYE_L, BROW_R, BROW_L, LIPS_OUT, SKIN_REF };
 
 /* =====================  UI & deteksi (browser)  ===================== */
 if (typeof document !== "undefined") {
   const $ = id => document.getElementById(id);
-  const state = { src: null, dst: null };
+  const state = { src: null, dst: null }; // {c: canvas, det: undefined | null | {c, pts, rot}}
   let landmarker = null;
   const setStatus = t => { $("status").textContent = t; };
   const refresh = () => {
@@ -302,7 +358,10 @@ if (typeof document !== "undefined") {
       setStatus("Memuat model deteksi wajah (sekitar 4 MB)...");
       const { FaceLandmarker, FilesetResolver } = await import(MP + "/vision_bundle.mjs");
       const fileset = await FilesetResolver.forVisionTasks(MP + "/wasm");
-      landmarker = await FaceLandmarker.createFromOptions(fileset, { baseOptions: { modelAssetPath: MODEL }, runningMode: "IMAGE", numFaces: 5 });
+      landmarker = await FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL }, runningMode: "IMAGE", numFaces: 5,
+        minFaceDetectionConfidence: 0.3, minFacePresenceConfidence: 0.3
+      });
       setStatus("Model siap. Pilih dua foto.");
       refresh();
     } catch (e) {
@@ -328,7 +387,7 @@ if (typeof document !== "undefined") {
     const g = c.getContext("2d");
     g.imageSmoothingQuality = "high";
     g.drawImage(img, 0, 0, c.width, c.height);
-    state[key] = c;
+    state[key] = { c, det: undefined };
     const prev = $("prev-" + key);
     prev.src = c.toDataURL("image/jpeg", 0.85);
     prev.hidden = false;
@@ -343,37 +402,106 @@ if (typeof document !== "undefined") {
     setStatus("Peran foto ditukar.");
   });
 
-  // ambil wajah terbesar di foto
-  function getPoints(c) {
-    const faces = landmarker.detect(c).faceLandmarks;
-    if (!faces.length) return null;
-    const pts = faces.map(f => f.slice(0, 468).map(p => [p.x * c.width, p.y * c.height]));
-    const area = P => { const x = P.map(p => p[0]), y = P.map(p => p[1]); return (Math.max(...x) - Math.min(...x)) * (Math.max(...y) - Math.min(...y)); };
-    return pts.sort((a, b) => area(b) - area(a))[0];
+  /* ---------- deteksi teliti: semua orientasi + penajaman ROI + pemindaian petak ---------- */
+  function rotCanvas(c, deg) { // putar searah jarum jam (kelipatan 90)
+    deg = ((deg % 360) + 360) % 360;
+    if (!deg) return c;
+    const r = document.createElement("canvas"), sw = deg === 90 || deg === 270;
+    r.width = sw ? c.height : c.width;
+    r.height = sw ? c.width : c.height;
+    const g = r.getContext("2d");
+    g.translate(r.width / 2, r.height / 2);
+    g.rotate(deg * Math.PI / 180);
+    g.drawImage(c, -c.width / 2, -c.height / 2);
+    return r;
+  }
+  const area = P => { const x = P.map(p => p[0]), y = P.map(p => p[1]); return (Math.max(...x) - Math.min(...x)) * (Math.max(...y) - Math.min(...y)); };
+  const bboxC = P => { const x = P.map(p => p[0]), y = P.map(p => p[1]); return [(Math.max(...x) + Math.min(...x)) / 2, (Math.max(...y) + Math.min(...y)) / 2]; };
+  const detect = c => landmarker.detect(c).faceLandmarks.map(f => f.slice(0, 468).map(p => [p.x * c.width, p.y * c.height]));
+  const bestOf = faces => faces.length ? faces.slice().sort((a, b) => area(b) - area(a))[0] : null;
+
+  // deteksi pada potongan persegi (x,y,side) yang diskalakan ke `size` px; hasil dipetakan balik
+  function cropDetect(c, x, y, side, size) {
+    const k = document.createElement("canvas");
+    k.width = k.height = size;
+    const g = k.getContext("2d"), z = size / side;
+    g.imageSmoothingQuality = "high";
+    const sx = Math.max(0, x), sy = Math.max(0, y), ex = Math.min(c.width, x + side), ey = Math.min(c.height, y + side);
+    if (ex <= sx || ey <= sy) return [];
+    g.drawImage(c, sx, sy, ex - sx, ey - sy, (sx - x) * z, (sy - y) * z, (ex - sx) * z, (ey - sy) * z);
+    return detect(k).map(P => P.map(([px, py]) => [px / z + x, py / z + y]));
   }
 
+  function detectTiles(c) {
+    const side = Math.min(c.width, c.height) * 0.7, out = [];
+    const pos = len => [0, (len - side) / 2, len - side];
+    for (const y of pos(c.height)) for (const x of pos(c.width)) out.push(...cropDetect(c, x, y, side, 768));
+    return out;
+  }
+
+  // deteksi ulang pada potongan ketat di sekitar wajah -> landmark lebih presisi
+  function refine(c, P) {
+    const [cx, cy] = bboxC(P), xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+    const side = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) * 1.7;
+    let best = null, bd = Infinity;
+    for (const Q of cropDetect(c, cx - side / 2, cy - side / 2, side, 640)) {
+      const [qx, qy] = bboxC(Q), d = Math.hypot(qx - cx, qy - cy);
+      if (d < bd) { bd = d; best = Q; }
+    }
+    if (best) {
+      const r = area(best) / area(P);
+      if (bd < side * 0.15 && r > 0.7 && r < 1.4 && Math.abs(rollOf(best) - rollOf(P)) < 20) return best;
+    }
+    return P;
+  }
+
+  // cari wajah di orientasi mana pun (0/90/180/270); pilih yang paling tegak
+  function findFace(c) {
+    for (const pass of [detect, detectTiles]) {
+      const cand = [];
+      for (const rot of [0, 180, 90, 270]) {
+        const rc = rotCanvas(c, rot), P = bestOf(pass(rc));
+        if (!P) continue;
+        const roll = Math.abs(rollOf(P));
+        cand.push({ c: rc, pts: P, rot, roll });
+        if (roll <= 30) break;
+      }
+      if (cand.length) {
+        cand.sort((a, b) => a.roll - b.roll);
+        const best = cand[0];
+        best.pts = refine(best.c, best.pts);
+        return best;
+      }
+    }
+    return null;
+  }
+
+  const ensureDet = o => { if (o.det === undefined) o.det = findFace(o.c); return o.det; };
+  const rotNote = (d, nama) => d.rot ? ` ${nama} terdeteksi terbalik/miring (${d.rot}°) dan dikoreksi otomatis.` : "";
+
   function runSwap() {
-    const sp0 = getPoints(state.src), dp = getPoints(state.dst);
-    if (!sp0) throw new Error("Wajah tidak terdeteksi di Foto Sumber. Gunakan foto wajah yang jelas dan menghadap depan.");
-    if (!dp) throw new Error("Wajah tidak terdeteksi di Foto Tujuan. Gunakan foto wajah yang jelas dan menghadap depan.");
+    const sd = ensureDet(state.src);
+    if (!sd) throw new Error("Wajah tidak terdeteksi di Foto Sumber (semua orientasi sudah dicoba). Gunakan foto dengan wajah yang terlihat jelas.");
+    const td = ensureDet(state.dst);
+    if (!td) throw new Error("Wajah tidak terdeteksi di Foto Tujuan (semua orientasi sudah dicoba). Gunakan foto dengan wajah yang terlihat jelas.");
 
     // perkecil sumber bila wajahnya jauh lebih besar dari wajah tujuan (hindari aliasing)
     const wid = P => Math.max(...P.map(p => p[0])) - Math.min(...P.map(p => p[0]));
-    let srcC = state.src, sp = sp0;
-    const ratio = wid(dp) * 1.15 / wid(sp0);
+    let srcC = sd.c, sp = sd.pts;
+    const ratio = wid(td.pts) * 1.15 / wid(sd.pts);
     if (ratio < 0.8) {
       srcC = document.createElement("canvas");
-      srcC.width = Math.max(1, Math.round(state.src.width * ratio));
-      srcC.height = Math.max(1, Math.round(state.src.height * ratio));
+      srcC.width = Math.max(1, Math.round(sd.c.width * ratio));
+      srcC.height = Math.max(1, Math.round(sd.c.height * ratio));
       const g = srcC.getContext("2d");
       g.imageSmoothingQuality = "high";
-      g.drawImage(state.src, 0, 0, srcC.width, srcC.height);
-      sp = sp0.map(p => [p[0] * srcC.width / state.src.width, p[1] * srcC.height / state.src.height]);
+      g.drawImage(sd.c, 0, 0, srcC.width, srcC.height);
+      sp = sd.pts.map(p => [p[0] * srcC.width / sd.c.width, p[1] * srcC.height / sd.c.height]);
     }
     const S = srcC.getContext("2d").getImageData(0, 0, srcC.width, srcC.height);
 
-    // proses hanya area wajah tujuan (+ margin)
-    const dstC = state.dst, W = dstC.width, H = dstC.height;
+    // proses hanya area wajah tujuan (+ margin) pada orientasi tegak
+    const dstC = td.c, dp = td.pts, W = dstC.width, H = dstC.height;
     const xs = dp.map(p => p[0]), ys = dp.map(p => p[1]);
     const m = 0.2 * Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
     const x0 = Math.max(0, Math.floor(Math.min(...xs) - m)), y0 = Math.max(0, Math.floor(Math.min(...ys) - m));
@@ -381,11 +509,17 @@ if (typeof document !== "undefined") {
     const T = dstC.getContext("2d").getImageData(x0, y0, x1 - x0, y1 - y0);
     const D = blendFace(S, sp, T, dp.map(p => [p[0] - x0, p[1] - y0]));
 
+    const res = document.createElement("canvas");
+    res.width = W; res.height = H;
+    const rg = res.getContext("2d");
+    rg.drawImage(dstC, 0, 0);
+    rg.putImageData(new ImageData(D, T.width, T.height), x0, y0);
+
+    // kembalikan ke orientasi asli foto tujuan
+    const fin = rotCanvas(res, (360 - td.rot) % 360);
     const out = $("out");
-    out.width = W; out.height = H;
-    const ctx = out.getContext("2d");
-    ctx.drawImage(dstC, 0, 0);
-    ctx.putImageData(new ImageData(D, T.width, T.height), x0, y0);
+    out.width = fin.width; out.height = fin.height;
+    out.getContext("2d").drawImage(fin, 0, 0);
     out.hidden = false;
     out.toBlob(b => {
       const a = $("btn-dl");
@@ -393,15 +527,15 @@ if (typeof document !== "undefined") {
       a.href = URL.createObjectURL(b);
       a.hidden = false;
     }, "image/png");
+    return "Selesai." + rotNote(sd, "Foto sumber") + rotNote(td, "Foto tujuan");
   }
 
   $("btn-swap").addEventListener("click", async () => {
     $("btn-swap").disabled = true;
-    setStatus("Memproses...");
+    setStatus("Mendeteksi wajah dan memproses...");
     await new Promise(r => setTimeout(r, 30));
     try {
-      runSwap();
-      setStatus("Selesai.");
+      setStatus(runSwap());
     } catch (e) {
       console.error(e);
       setStatus(e.message || "Terjadi kesalahan saat memproses. Coba foto lain.");
