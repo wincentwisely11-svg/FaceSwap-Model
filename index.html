@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Face Swap</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>Face Swap</h1>
+    <p class="sub">Wajah dari Foto Sumber akan dipasang ke Foto Tujuan. Semua diproses di browser.</p>
+
+    <section class="grid">
+      <label class="box">
+        <span>Foto Sumber (wajah yang diambil)</span>
+        <input type="file" id="file-src" accept="image/*">
+        <img id="prev-src" alt="" hidden>
+      </label>
+      <label class="box">
+        <span>Foto Tujuan (wajah yang diganti)</span>
+        <input type="file" id="file-dst" accept="image/*">
+        <img id="prev-dst" alt="" hidden>
+      </label>
+    </section>
+
+    <div class="actions">
+      <button id="btn-swap" disabled>Tukar Wajah</button>
+      <button id="btn-flip" class="ghost" disabled>Tukar Peran Foto</button>
+      <a id="btn-dl" class="btn ghost" download="faceswap.png" hidden>Unduh Hasil</a>
+    </div>
+
+    <p id="status">Memuat...</p>
+    <canvas id="out" hidden></canvas>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>
